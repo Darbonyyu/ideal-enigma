@@ -1,0 +1,112 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Optional: direct URL to game-project.zip (empty = use repo contents or committed game-project.zip)"
+        required: false
+        default: ""
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md"]
+
+env:
+  UNITY_VERSION: 2022.3.45f1   # должен совпадать с ProjectSettings/ProjectVersion.txt
+
+jobs:
+  build-android:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # 1) Репозиторий
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Free disk space (Unity image is large)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      # 2) Скачать/распаковать входящий ZIP (если он есть), иначе берём репозиторий как есть
+      - name: Prepare project (download / unzip game-project.zip)
+        id: prep
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ZIP_URL:-}" ]; then
+            echo "Downloading ZIP from input URL"
+            curl -fsSL -o game-project.zip "$ZIP_URL"
+          fi
+          if [ -f game-project.zip ]; then
+            rm -rf _project && mkdir _project
+            unzip -q game-project.zip -d _project
+            ASSETS=$(find _project -maxdepth 3 -type d -name Assets | head -n1)
+            [ -n "$ASSETS" ] || { echo "::error::No Assets/ folder inside game-project.zip"; exit 1; }
+            PROJECT_PATH=$(dirname "$ASSETS")
+          else
+            PROJECT_PATH="."
+          fi
+          [ -d "$PROJECT_PATH/Assets" ] || { echo "::error::Unity project not found (no Assets/)"; exit 1; }
+          echo "Unity project path: $PROJECT_PATH"
+          echo "path=$PROJECT_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Check Unity license secrets
+        shell: bash
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        run: |
+          if [ -z "${UNITY_LICENSE:-}" ] && [ -z "${UNITY_SERIAL:-}" ]; then
+            echo "::error::Add repo secrets UNITY_LICENSE (+UNITY_EMAIL, UNITY_PASSWORD) or UNITY_SERIAL. See https://game.ci/docs/github/activation"
+            exit 1
+          fi
+
+      # 3) Кэш Library для ускорения
+      - name: Cache Library
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.prep.outputs.path }}/Library
+          key: Library-Android-${{ hashFiles('**/Packages/manifest.json', '**/ProjectSettings/ProjectVersion.txt') }}
+          restore-keys: Library-Android-
+
+      # 4) Сборка. Docker-образ game-ci уже содержит Unity, Android SDK/NDK и JDK,
+      #    поэтому отдельная установка SDK не требуется.
+      - name: Build APK
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          projectPath: ${{ steps.prep.outputs.path }}
+          unityVersion: ${{ env.UNITY_VERSION }}
+          targetPlatform: Android
+          buildMethod: BuildScript.BuildAndroid
+          buildName: CombatRally
+          buildsPath: build
+          androidExportType: androidPackage      # = APK
+          androidVersionCode: ${{ github.run_number }}
+          versioning: None
+          allowDirtyBuild: true
+
+      # 5) Артефакт
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CombatRally-Android-apk
+          path: build/Android/*.apk
+          if-no-files-found: error
+          retention-days: 14
